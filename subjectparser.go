@@ -6,6 +6,19 @@ import (
 	"strings"
 )
 
+// The regular expressions, compiled once (they were compiled on every call:
+// ~90 µs and 265 allocations per subject).
+var (
+	// file and segment numbers, [X/Y] and (X/Y); the text after the last pair is "tail"
+	reNumbers = regexp.MustCompile(`(?i)(?:(?P<remainder>.*?) *(?:(?P<files>(?:"?\[|[<[]? *)(?P<file>\d+) */ *(?P<totalfiles>\d+) *(?:\]"?|[>\]])?)|(?P<segments>"?\((?P<segment>\d+) */ *(?P<totalsegments>\d+)\)"?))|(?P<tail>.*$))`)
+	// "x of y" file numbers
+	reXofY = regexp.MustCompile(`(?i)(?:(?P<remainder1>.*?) *(?P<files>(?:\[|[<[]? *(?:file|datei)?) *(?P<file>\d+) *(?:of|von) *(?P<totalfiles>\d+) *(?:\]|[>\]])?)(?P<remainder2>.*$))`)
+	// a filename between quotes, with or without an extension
+	reQuoted = regexp.MustCompile(`(?i)^(?P<header>.*?)?[- ]*"+(?P<filename>(?P<basefilename>.*?)(?:\.(?P<extension>(?:7z\.)?(?:vol\d+\+\d+\.par2?|part\d+\.[^ "\.]*|[^ "\.]*\.\d+|[^ "\.]*)))?)"+`)
+	// a filename without quotes, found by its extension
+	reUnquoted = regexp.MustCompile(`(?i)^(?P<filename>(?P<basefilename>.*?)\.(?P<extension>(?:vol\d+\+\d+\.par2?|part\d+\.[^ "\.]*|[^ "\.]*\.\d+|[^ "\.]*))(?:[" ]|$))`)
+)
+
 type Subject struct {
 	Subject       string // full subject
 	Header        string // header (remaining text before the filename)
@@ -34,19 +47,18 @@ func Parse(s string) (Subject, error) {
 	// we also assume that max. two number pairs are present (segment numbers or segment and file numbers)
 	// we further assume that if both number pairs are present the last one are the segment numbers,
 	// and that no relevant info apperars in the subject after them (usualy only "yEnc" and the size is stated after the segment numbers)
-	r := regexp.MustCompile(`(?i)(?:(?P<remainder>.*?) *(?:(?P<files>(?:"?\[|[<[]? *)(?P<file>\d+) */ *(?P<totalfiles>\d+) *(?:\]"?|[>\]])?)|(?P<segments>"?\((?P<segment>\d+) */ *(?P<totalsegments>\d+)\)"?))|.*$)`)
-	matches := findAllNamedMatches(r, subject.Subject)
+	matches := findAllNamedMatches(reNumbers, subject.Subject)
 	if matches != nil {
 		// check the matches from back to start
 		for counter := len(matches) - 1; counter >= 0; counter-- {
 			if subject.File == 0 && subject.Segment == 0 {
 				// if neither segments nor files are assigned yet, we just assign
 				if matches[counter]["files"] != "" {
-					subject.File, _ = strconv.Atoi(matches[counter]["file"])
-					subject.TotalFiles, _ = strconv.Atoi(matches[counter]["totalfiles"])
+					subject.File = num(matches[counter]["file"])
+					subject.TotalFiles = num(matches[counter]["totalfiles"])
 				} else if matches[counter]["segments"] != "" { // we have either [files] or (segments) in a match but not both
-					subject.Segment, _ = strconv.Atoi(matches[counter]["segment"])
-					subject.TotalSegments, _ = strconv.Atoi(matches[counter]["totalsegments"])
+					subject.Segment = num(matches[counter]["segment"])
+					subject.TotalSegments = num(matches[counter]["totalsegments"])
 				}
 			} else if subject.TotalFiles == 0 || subject.TotalSegments == 0 {
 				// one of them is already assigned, we do some checks
@@ -63,11 +75,11 @@ func Parse(s string) (Subject, error) {
 					// if not, probably only segment numbers are present but use square brackets
 					// in this case we assign the "file" numbers to the segments
 					if subject.TotalSegments == 0 {
-						subject.Segment, _ = strconv.Atoi(matches[counter]["file"])
-						subject.TotalSegments, _ = strconv.Atoi(matches[counter]["totalfiles"])
+						subject.Segment = num(matches[counter]["file"])
+						subject.TotalSegments = num(matches[counter]["totalfiles"])
 					} else {
-						subject.File, _ = strconv.Atoi(matches[counter]["file"])
-						subject.TotalFiles, _ = strconv.Atoi(matches[counter]["totalfiles"])
+						subject.File = num(matches[counter]["file"])
+						subject.TotalFiles = num(matches[counter]["totalfiles"])
 					}
 				} else if matches[counter]["segments"] != "" { // we have either [files] or (segments) in a match but not both
 					// check if we have already assigned the segment numbers
@@ -75,11 +87,11 @@ func Parse(s string) (Subject, error) {
 					// in this case we assume that segment numbers are at the end
 					// and assign these "segment" numbers to the files
 					if subject.TotalSegments != 0 {
-						subject.File, _ = strconv.Atoi(matches[counter]["segment"])
-						subject.TotalFiles, _ = strconv.Atoi(matches[counter]["totalsegments"])
+						subject.File = num(matches[counter]["segment"])
+						subject.TotalFiles = num(matches[counter]["totalsegments"])
 					} else {
-						subject.Segment, _ = strconv.Atoi(matches[counter]["segment"])
-						subject.TotalSegments, _ = strconv.Atoi(matches[counter]["totalsegments"])
+						subject.Segment = num(matches[counter]["segment"])
+						subject.TotalSegments = num(matches[counter]["totalsegments"])
 					}
 				}
 			}
@@ -87,6 +99,14 @@ func Parse(s string) (Subject, error) {
 		// combine the remainders of the matches for further parsing
 		for counter := 0; counter <= len(matches)-1; counter++ {
 			remainder = strings.TrimSpace(remainder + " " + strings.TrimSpace(matches[counter]["remainder"]))
+		}
+		// the text after the last number pair is only irrelevant after segment
+		// numbers; without them it holds the filename ("file.bin" yEnc, or
+		// [1/5] "file.rar"), which was lost
+		if subject.TotalSegments == 0 {
+			for counter := 0; counter <= len(matches)-1; counter++ {
+				remainder = strings.TrimSpace(remainder + " " + strings.TrimSpace(matches[counter]["tail"]))
+			}
 		}
 	} else {
 		// if we had no match we use the full subject for further parsing
@@ -101,11 +121,10 @@ func Parse(s string) (Subject, error) {
 	// check if we have found some file numbers
 	if subject.TotalFiles == 0 {
 		// if no file numbers were found we first try some edge cases like "x of y"
-		r := regexp.MustCompile(`(?i)(?:(?P<remainder1>.*?) *(?P<files>(?:\[|[<[]? *(?:file|datei)?) *(?P<file>\d+) *(?:of|von) *(?P<totalfiles>\d+) *(?:\]|[>\]])?)(?P<remainder2>.*$))`)
-		matches := findAllNamedMatches(r, remainder)
+		matches := findAllNamedMatches(reXofY, remainder)
 		if matches != nil && matches[0]["files"] != "" {
-			subject.File, _ = strconv.Atoi(matches[0]["file"])
-			subject.TotalFiles, _ = strconv.Atoi(matches[0]["totalfiles"])
+			subject.File = num(matches[0]["file"])
+			subject.TotalFiles = num(matches[0]["totalfiles"])
 			remainder = strings.TrimSpace(strings.TrimSpace(matches[0]["remainder1"]) + " " + strings.TrimSpace(matches[0]["remainder2"]))
 		} else {
 			// if still nothing was found, we assume it is a single file post
@@ -118,16 +137,14 @@ func Parse(s string) (Subject, error) {
 	// we first assume that the filename is between quotes and may or may not end with an extension
 	// we also assume that there is no more relevant information after the filename
 	// everything before the filename is considered to be the header
-	r = regexp.MustCompile(`(?i)^(?P<header>.*?)?[- ]*"+(?P<filename>(?P<basefilename>.*?)(?:\.(?P<extension>(?:7z\.)?(?:vol\d+\+\d+\.par2?|part\d+\.[^ "\.]*|[^ "\.]*\.\d+|[^ "\.]*)))?)"+`)
-	matches = findAllNamedMatches(r, remainder)
+	matches = findAllNamedMatches(reQuoted, remainder)
 	if matches != nil {
 		subject.Header = strings.Trim(matches[0]["header"], " -")
 		subject.Filename = strings.Trim(matches[0]["filename"], " -")
 		subject.Basefilename = strings.Trim(matches[0]["basefilename"], " -")
 	} else {
 		// if no filename was found between quotes, we assume the whole remaining subject is the filename and we only search for an extension
-		r = regexp.MustCompile(`(?i)^(?P<filename>(?P<basefilename>.*?)\.(?P<extension>(?:vol\d+\+\d+\.par2?|part\d+\.[^ "\.]*|[^ "\.]*\.\d+|[^ "\.]*))(?:[" ]|$))`)
-		matches = findAllNamedMatches(r, remainder)
+		matches = findAllNamedMatches(reUnquoted, remainder)
 		if matches != nil {
 			subject.Filename = strings.Trim(matches[0]["filename"], " -")
 			subject.Basefilename = strings.Trim(matches[0]["basefilename"], " -")
@@ -147,6 +164,17 @@ func Parse(s string) (Subject, error) {
 
 	return subject, nil
 
+}
+
+// num converts a matched number. One that doesn't fit an int counts as
+// missing (0); strconv.Atoi would return the largest int, which callers
+// summed and used as a size.
+func num(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // helper function for easier handling of named sub matches
